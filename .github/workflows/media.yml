@@ -1,0 +1,142 @@
+name: MEDIA
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to process"
+        required: true
+        type: choice
+        options:
+          - video
+          - image
+          - all
+        default: all
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Turn the newline-separated secret for the chosen mode into a JSON
+  # array so the process job can fan out across links in parallel.
+  # ---------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - id: build-matrix
+        env:
+          LINKS: ${{ secrets.M }}
+        run: |
+          JSON=$(printf '%s\n' "$LINKS" | grep -v '^\s*$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+
+  process:
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4          # tune to taste vs. rate limits / billed minutes
+      matrix:
+        url: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg webp p7zip-full
+          pip install -U gallery-dl
+
+      # -----------------------------------------------------------------
+      # Cache the compiled telegram-bot-api binary so we only pay the
+      # cmake/TDLib build cost once (until the cache key changes).
+      # -----------------------------------------------------------------
+      - name: Cache telegram-bot-api binary
+        id: cache-tbai
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/telegram-bot-api
+          key: tbai-${{ runner.os }}-v1
+
+      - name: Build local Bot API server
+        if: steps.cache-tbai.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y cmake g++ git zlib1g-dev libssl-dev gperf php-cli make
+          git clone --recursive https://github.com/tdlib/telegram-bot-api.git
+          cd telegram-bot-api
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . --target install -j$(nproc)
+
+      - name: Start local Bot API server
+        run: |
+          telegram-bot-api --api-id=${{ secrets.TELEGRAM_API_ID }} \
+                            --api-hash=${{ secrets.TELEGRAM_API_HASH }} \
+                            --local &
+          sleep 10
+
+      - name: Process link
+        env:
+          URL: ${{ matrix.url }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -e
+          echo "=== Processing: $URL (mode=$MODE) ==="
+
+          rm -rf downloads compressed compressed.mp4 gallery.7z
+          mkdir -p downloads compressed
+
+          gallery-dl "$URL" -d ./downloads
+
+          SENT_VIDEO=0
+          SENT_IMAGE=0
+
+          if [ "$MODE" = "video" ] || [ "$MODE" = "all" ]; then
+            VIDEO_FILES=$(find ./downloads -type f \( -iname "*.mp4" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.mov" -o -iname "*.avi" \))
+            if [ -n "$VIDEO_FILES" ]; then
+              while IFS= read -r vidfile; do
+                rm -f compressed.mp4
+                ffmpeg -y -i "$vidfile" -vf "scale=1280:-2" \
+                       -c:v libx264 -preset veryfast -crf 23 \
+                       -c:a aac -b:a 128k \
+                       -movflags +faststart \
+                       compressed.mp4
+
+                WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 compressed.mp4)
+                HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
+                DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
+
+                curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+                     -F video=@"compressed.mp4" \
+                     -F width="$WIDTH" \
+                     -F height="$HEIGHT" \
+                     -F duration="$DURATION" \
+                     -F supports_streaming=true \
+                     "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
+              done <<< "$VIDEO_FILES"
+              SENT_VIDEO=1
+            fi
+          fi
+
+          if [ "$MODE" = "image" ] || [ "$MODE" = "all" ]; then
+            IMG_FILES=$(find ./downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.gif" \))
+            if [ -n "$IMG_FILES" ]; then
+              while IFS= read -r img; do
+                filename=$(basename "$img")
+                name="${filename%.*}"
+                cwebp -q 85 -m 6 -mt -sharp_yuv "$img" -o "./compressed/${name}.webp" 2>/dev/null || cp "$img" "./compressed/"
+              done <<< "$IMG_FILES"
+
+              7z a -mx=9 gallery.7z ./compressed/*
+
+              curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+                   -F document=@"gallery.7z" \
+                   "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument"
+              SENT_IMAGE=1
+            fi
+          fi
+
+          if [ "$SENT_VIDEO" -eq 0 ] && [ "$SENT_IMAGE" -eq 0 ]; then
+            echo "=== Nothing found for: $URL ==="
+          fi
+
+          echo "=== Done: $URL ==="
