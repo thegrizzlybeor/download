@@ -14,31 +14,8 @@ on:
         default: all
 
 jobs:
-  # ---------------------------------------------------------------------
-  # Turn the newline-separated secret for the chosen mode into a JSON
-  # array so the process job can fan out across links in parallel.
-  # ---------------------------------------------------------------------
-  prepare:
+  process-all:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.build-matrix.outputs.matrix }}
-    steps:
-      - id: build-matrix
-        env:
-          LINKS: ${{ secrets.M }}
-        run: |
-          JSON=$(printf '%s\n' "$LINKS" | grep -v '^\s*$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
-
-  process:
-    needs: prepare
-    if: needs.prepare.outputs.matrix != '[]'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 4          # tune to taste vs. rate limits / billed minutes
-      matrix:
-        url: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
       - name: Install deps
         run: |
@@ -48,7 +25,7 @@ jobs:
 
       # -----------------------------------------------------------------
       # Cache the compiled telegram-bot-api binary so we only pay the
-      # cmake/TDLib build cost once (until the cache key changes).
+      # cmake/TDLib build cost once, instead of on every single run.
       # -----------------------------------------------------------------
       - name: Cache telegram-bot-api binary
         id: cache-tbai
@@ -74,69 +51,71 @@ jobs:
                             --local &
           sleep 10
 
-      - name: Process link
+      - name: Process each link
         env:
-          URL: ${{ matrix.url }}
+          LINKS: ${{ secrets.M }}
           MODE: ${{ github.event.inputs.mode }}
         run: |
-          set -e
-          echo "=== Processing: $URL (mode=$MODE) ==="
+          echo "$LINKS" | while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "=== Processing: $url (mode=$MODE) ==="
 
-          rm -rf downloads compressed compressed.mp4 gallery.7z
-          mkdir -p downloads compressed
+            rm -rf downloads compressed compressed.mp4 gallery.7z
+            mkdir -p downloads compressed
 
-          gallery-dl "$URL" -d ./downloads
+            gallery-dl "$url" -d ./downloads
 
-          SENT_VIDEO=0
-          SENT_IMAGE=0
+            SENT_VIDEO=0
+            SENT_IMAGE=0
 
-          if [ "$MODE" = "video" ] || [ "$MODE" = "all" ]; then
-            VIDEO_FILES=$(find ./downloads -type f \( -iname "*.mp4" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.mov" -o -iname "*.avi" \))
-            if [ -n "$VIDEO_FILES" ]; then
-              while IFS= read -r vidfile; do
-                rm -f compressed.mp4
-                ffmpeg -y -i "$vidfile" -vf "scale=1280:-2" \
-                       -c:v libx264 -preset veryfast -crf 23 \
-                       -c:a aac -b:a 128k \
-                       -movflags +faststart \
-                       compressed.mp4
+            if [ "$MODE" = "video" ] || [ "$MODE" = "all" ]; then
+              VIDEO_FILES=$(find ./downloads -type f \( -iname "*.mp4" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.mov" -o -iname "*.avi" \))
+              if [ -n "$VIDEO_FILES" ]; then
+                echo "$VIDEO_FILES" | while IFS= read -r vidfile; do
+                  rm -f compressed.mp4
+                  ffmpeg -y -i "$vidfile" -vf "scale=1280:-2" \
+                         -c:v libx264 -preset veryfast -crf 23 \
+                         -c:a aac -b:a 128k \
+                         -movflags +faststart \
+                         compressed.mp4
 
-                WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 compressed.mp4)
-                HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
-                DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
+                  WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 compressed.mp4)
+                  HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
+                  DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
+
+                  curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+                       -F video=@"compressed.mp4" \
+                       -F width="$WIDTH" \
+                       -F height="$HEIGHT" \
+                       -F duration="$DURATION" \
+                       -F supports_streaming=true \
+                       "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
+                done
+                SENT_VIDEO=1
+              fi
+            fi
+
+            if [ "$MODE" = "image" ] || [ "$MODE" = "all" ]; then
+              IMG_FILES=$(find ./downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.gif" \))
+              if [ -n "$IMG_FILES" ]; then
+                echo "$IMG_FILES" | while IFS= read -r img; do
+                  filename=$(basename "$img")
+                  name="${filename%.*}"
+                  cwebp -q 85 -m 6 -mt -sharp_yuv "$img" -o "./compressed/${name}.webp" 2>/dev/null || cp "$img" "./compressed/"
+                done
+
+                7z a -mx=9 gallery.7z ./compressed/*
 
                 curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-                     -F video=@"compressed.mp4" \
-                     -F width="$WIDTH" \
-                     -F height="$HEIGHT" \
-                     -F duration="$DURATION" \
-                     -F supports_streaming=true \
-                     "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
-              done <<< "$VIDEO_FILES"
-              SENT_VIDEO=1
+                     -F document=@"gallery.7z" \
+                     "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument"
+                SENT_IMAGE=1
+              fi
             fi
-          fi
 
-          if [ "$MODE" = "image" ] || [ "$MODE" = "all" ]; then
-            IMG_FILES=$(find ./downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.gif" \))
-            if [ -n "$IMG_FILES" ]; then
-              while IFS= read -r img; do
-                filename=$(basename "$img")
-                name="${filename%.*}"
-                cwebp -q 85 -m 6 -mt -sharp_yuv "$img" -o "./compressed/${name}.webp" 2>/dev/null || cp "$img" "./compressed/"
-              done <<< "$IMG_FILES"
-
-              7z a -mx=9 gallery.7z ./compressed/*
-
-              curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-                   -F document=@"gallery.7z" \
-                   "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument"
-              SENT_IMAGE=1
+            if [ "$SENT_VIDEO" -eq 0 ] && [ "$SENT_IMAGE" -eq 0 ]; then
+              echo "=== Nothing found for: $url ==="
             fi
-          fi
 
-          if [ "$SENT_VIDEO" -eq 0 ] && [ "$SENT_IMAGE" -eq 0 ]; then
-            echo "=== Nothing found for: $URL ==="
-          fi
-
-          echo "=== Done: $URL ==="
+            echo "=== Done: $url ==="
+          done
