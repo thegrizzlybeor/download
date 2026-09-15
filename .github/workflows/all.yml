@@ -1,0 +1,98 @@
+name: ALL
+
+on:
+  workflow_dispatch:
+
+jobs:
+  process-all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg webp p7zip-full cmake g++ git zlib1g-dev libssl-dev gperf php-cli make
+          pip install -U yt-dlp gallery-dl
+
+      - name: Build local Bot API server
+        run: |
+          git clone --recursive https://github.com/tdlib/telegram-bot-api.git
+          cd telegram-bot-api
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . --target install -j$(nproc)
+
+      - name: Start local Bot API server
+        run: |
+          telegram-bot-api --api-id=${{ secrets.TELEGRAM_API_ID }} \
+                            --api-hash=${{ secrets.TELEGRAM_API_HASH }} \
+                            --local &
+          sleep 10
+
+      - name: Process each link
+        env:
+          ALL_LINKS: ${{ secrets.ALL }}
+        run: |
+          echo "$ALL_LINKS" | while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "=== Processing: $url ==="
+
+            rm -f video.* compressed.mp4
+            rm -rf downloads compressed gallery.7z
+            mkdir -p downloads compressed
+
+            # --- Try video first ---
+            VIDEO_FOUND=0
+            if yt-dlp -o "video.%(ext)s" -f "bestvideo[filesize<2000M]+bestaudio/best" "$url"; then
+              if ls video.* >/dev/null 2>&1; then
+                VIDEO_FOUND=1
+                FILE=$(ls video.* | head -n 1)
+
+                ffmpeg -y -i "$FILE" -vf "scale=1280:-2" \
+                       -c:v libx265 -crf 26 -preset medium \
+                       -c:a aac -b:a 128k \
+                       -movflags +faststart \
+                       compressed.mp4
+
+                WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 compressed.mp4)
+                HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
+                DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
+
+                curl -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+                     -F video=@"compressed.mp4" \
+                     -F width="$WIDTH" \
+                     -F height="$HEIGHT" \
+                     -F duration="$DURATION" \
+                     -F supports_streaming=true \
+                     "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
+
+                echo "=== Video sent for: $url ==="
+              fi
+            fi
+
+            # --- Always also try images (page can have both) ---
+            gallery-dl "$url" -d ./downloads || true
+
+            IMG_COUNT=$(find ./downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.gif" \) | wc -l)
+
+            if [ "$IMG_COUNT" -gt 0 ]; then
+              find ./downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.gif" \) | while read -r img; do
+                filename=$(basename "$img")
+                name="${filename%.*}"
+                cwebp -q 85 -m 6 -mt -sharp_yuv "$img" -o "./compressed/${name}.webp" 2>/dev/null || cp "$img" "./compressed/"
+              done
+
+              7z a -mx=9 gallery.7z ./compressed/*
+
+              curl -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+                   -F document=@"gallery.7z" \
+                   "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument"
+
+              echo "=== Images sent for: $url ==="
+            fi
+
+            if [ "$VIDEO_FOUND" -eq 0 ] && [ "$IMG_COUNT" -eq 0 ]; then
+              echo "=== Nothing found for: $url ==="
+            fi
+
+            echo "=== Done: $url ==="
+          done
