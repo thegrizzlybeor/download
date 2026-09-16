@@ -10,16 +10,18 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg cmake g++ git zlib1g-dev libssl-dev gperf php-cli make
-          pip install -U yt-dlp
+          sudo apt-get install -y ffmpeg
+          pip install -U gallery-dl
 
-      - name: Build local Bot API server
+      - name: Get local Bot API server binary
         run: |
-          git clone --recursive https://github.com/tdlib/telegram-bot-api.git
-          cd telegram-bot-api
-          mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release ..
-          cmake --build . --target install -j$(nproc)
+          docker pull sayyid5416/telegram-bot-api:latest
+          id=$(docker create sayyid5416/telegram-bot-api:latest)
+          docker cp "$id":/usr/local/bin/telegram-bot-api ./telegram-bot-api || \
+          docker cp "$id":/bin/telegram-bot-api ./telegram-bot-api
+          docker rm "$id"
+          chmod +x ./telegram-bot-api
+          sudo mv ./telegram-bot-api /usr/local/bin/telegram-bot-api
 
       - name: Start local Bot API server
         run: |
@@ -38,23 +40,17 @@ jobs:
             [ -z "$url" ] && continue
             echo "=== Processing: $url ==="
 
-            rm -f video.* compressed.mp4
+            rm -rf dl video.* compressed.mp4
+            mkdir -p dl
 
-            if ! yt-dlp -o "video.%(ext)s" \
-                        --merge-output-format mp4 \
-                        -f "bestvideo[filesize<2000M]+bestaudio/best[filesize<2000M]/best" \
-                        "$url"; then
-              echo "!!! yt-dlp failed for $url, skipping"
+            if ! gallery-dl -D dl -o filename="video.{extension}" "$url"; then
+              echo "!!! gallery-dl failed for $url, skipping"
               continue
             fi
 
-            FILE="video.mp4"
-            if [ ! -f "$FILE" ]; then
-              # fallback in case the container isn't mp4 for some reason
-              FILE=$(ls video.* 2>/dev/null | head -n 1)
-            fi
+            FILE=$(find dl -type f \( -iname "*.mp4" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.mov" \) | head -n 1)
             if [ -z "${FILE:-}" ] || [ ! -f "$FILE" ]; then
-              echo "!!! No downloaded file found for $url, skipping"
+              echo "!!! No downloaded video file found for $url, skipping"
               continue
             fi
 
