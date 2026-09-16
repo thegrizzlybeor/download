@@ -40,7 +40,7 @@ jobs:
             [ -z "$url" ] && continue
             echo "=== Processing: $url ==="
 
-            rm -rf dl video.* compressed.mp4
+            rm -rf dl video.* compressed.mp4 thumb.jpg
             mkdir -p dl
 
             if ! gallery-dl -D dl -o filename="video.{extension}" "$url"; then
@@ -55,7 +55,8 @@ jobs:
             fi
 
             if ! ffmpeg -y -i "$FILE" -vf "scale=1280:-2" \
-                   -c:v libx264 -crf 23 -preset veryfast \
+                   -pix_fmt yuv420p \
+                   -c:v libx264 -profile:v high -level 4.0 -crf 23 -preset veryfast \
                    -c:a aac -b:a 128k \
                    -movflags +faststart \
                    compressed.mp4; then
@@ -68,17 +69,22 @@ jobs:
               continue
             fi
 
+            ffmpeg -y -i compressed.mp4 -ss 00:00:01 -vframes 1 -vf "scale=320:-1" thumb.jpg || true
+
             WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 compressed.mp4)
             HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
             DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
 
-            curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-                 -F video=@"compressed.mp4" \
-                 -F width="$WIDTH" \
-                 -F height="$HEIGHT" \
-                 -F duration="$DURATION" \
-                 -F supports_streaming=true \
-                 "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
+            CURL_ARGS=(-sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}"
+                 -F video=@"compressed.mp4"
+                 -F width="$WIDTH"
+                 -F height="$HEIGHT"
+                 -F duration="$DURATION"
+                 -F supports_streaming=true)
+            if [ -s thumb.jpg ]; then
+              CURL_ARGS+=(-F thumb=@"thumb.jpg")
+            fi
+            curl "${CURL_ARGS[@]}" "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
 
             echo "=== Done: $url ==="
           done
