@@ -32,27 +32,51 @@ jobs:
         env:
           VID_LINKS: ${{ secrets.VID }}
         run: |
+          set -uo pipefail
+
           echo "$VID_LINKS" | while IFS= read -r url; do
             [ -z "$url" ] && continue
             echo "=== Processing: $url ==="
 
             rm -f video.* compressed.mp4
 
-            yt-dlp -o "video.%(ext)s" -f "bestvideo[filesize<2000M]+bestaudio/best" "$url"
+            if ! yt-dlp -o "video.%(ext)s" \
+                        --merge-output-format mp4 \
+                        -f "bestvideo[filesize<2000M]+bestaudio/best[filesize<2000M]/best" \
+                        "$url"; then
+              echo "!!! yt-dlp failed for $url, skipping"
+              continue
+            fi
 
-            FILE=$(ls video.* | head -n 1)
+            FILE="video.mp4"
+            if [ ! -f "$FILE" ]; then
+              # fallback in case the container isn't mp4 for some reason
+              FILE=$(ls video.* 2>/dev/null | head -n 1)
+            fi
+            if [ -z "${FILE:-}" ] || [ ! -f "$FILE" ]; then
+              echo "!!! No downloaded file found for $url, skipping"
+              continue
+            fi
 
-            ffmpeg -y -i "$FILE" -vf "scale=1280:-2" \
-                   -c:v libx265 -crf 26 -preset medium \
+            if ! ffmpeg -y -i "$FILE" -vf "scale=1280:-2" \
+                   -c:v libx264 -crf 23 -preset veryfast \
                    -c:a aac -b:a 128k \
                    -movflags +faststart \
-                   compressed.mp4
+                   compressed.mp4; then
+              echo "!!! ffmpeg failed for $url, skipping"
+              continue
+            fi
+
+            if [ ! -s compressed.mp4 ]; then
+              echo "!!! compressed.mp4 missing/empty for $url, skipping"
+              continue
+            fi
 
             WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 compressed.mp4)
             HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
             DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
 
-            curl -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
                  -F video=@"compressed.mp4" \
                  -F width="$WIDTH" \
                  -F height="$HEIGHT" \
