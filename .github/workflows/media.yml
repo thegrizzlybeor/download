@@ -56,11 +56,14 @@ jobs:
           LINKS: ${{ secrets.M }}
           MODE: ${{ github.event.inputs.mode }}
         run: |
-          echo "$LINKS" | while IFS= read -r url; do
+          # NOTE: using process substitution (< <(...)) instead of piping
+          # into the while loop. This keeps the loop's stdin isolated from
+          # any command run inside it.
+          while IFS= read -r url; do
             [ -z "$url" ] && continue
             echo "=== Processing: $url (mode=$MODE) ==="
 
-            rm -rf downloads compressed compressed.mp4 gallery.7z
+            rm -rf downloads compressed compressed.mp4 thumb.jpg gallery.7z
             mkdir -p downloads compressed
 
             gallery-dl "$url" -d ./downloads
@@ -71,11 +74,27 @@ jobs:
             if [ "$MODE" = "video" ] || [ "$MODE" = "all" ]; then
               VIDEO_FILES=$(find ./downloads -type f \( -iname "*.mp4" -o -iname "*.webm" -o -iname "*.mkv" -o -iname "*.mov" -o -iname "*.avi" \))
               if [ -n "$VIDEO_FILES" ]; then
-                echo "$VIDEO_FILES" | while IFS= read -r vidfile; do
-                  rm -f compressed.mp4
-                  ffmpeg -y -i "$vidfile" -vf "scale=1280:-2" \
-                         -c:v libx264 -preset veryfast -crf 23 \
-                         -c:a aac -b:a 128k \
+                while IFS= read -r vidfile; do
+                  [ -z "$vidfile" ] && continue
+                  rm -f compressed.mp4 thumb.jpg
+
+                  # -nostdin: CRITICAL. Without this, ffmpeg reads from the
+                  # same stdin as the outer "while read url" loop and can
+                  # swallow the remaining links/videos, so only the first
+                  # one ever gets processed. This was the root cause of
+                  # "sometimes" only one link/video going through.
+                  #
+                  # -pix_fmt yuv420p: forces standard 4:2:0 chroma so mobile
+                  # Telegram clients can hardware-decode and progressively
+                  # stream the file instead of falling back to a full
+                  # download-then-play.
+                  #
+                  # scale=-2:540 + crf 28: targets ~540p and roughly a 60%+
+                  # size cut vs the previous 1280-wide/crf23 encode.
+                  ffmpeg -nostdin -y -i "$vidfile" \
+                         -vf "scale=-2:540" \
+                         -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+                         -c:a aac -b:a 96k \
                          -movflags +faststart \
                          compressed.mp4
 
@@ -83,14 +102,19 @@ jobs:
                   HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 compressed.mp4)
                   DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 compressed.mp4 | cut -d. -f1)
 
+                  # Grab a thumbnail so Telegram shows the scrubber/duration
+                  # immediately instead of waiting on the client to generate one.
+                  ffmpeg -nostdin -y -ss 1 -i compressed.mp4 -vframes 1 -vf "scale=320:-1" thumb.jpg 2>/dev/null
+
                   curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
                        -F video=@"compressed.mp4" \
+                       -F thumb=@"thumb.jpg" \
                        -F width="$WIDTH" \
                        -F height="$HEIGHT" \
                        -F duration="$DURATION" \
                        -F supports_streaming=true \
                        "http://localhost:8081/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo"
-                done
+                done <<< "$VIDEO_FILES"
                 SENT_VIDEO=1
               fi
             fi
@@ -98,13 +122,14 @@ jobs:
             if [ "$MODE" = "image" ] || [ "$MODE" = "all" ]; then
               IMG_FILES=$(find ./downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.gif" \))
               if [ -n "$IMG_FILES" ]; then
-                echo "$IMG_FILES" | while IFS= read -r img; do
+                while IFS= read -r img; do
+                  [ -z "$img" ] && continue
                   filename=$(basename "$img")
                   name="${filename%.*}"
                   cwebp -q 85 -m 6 -mt -sharp_yuv "$img" -o "./compressed/${name}.webp" 2>/dev/null || cp "$img" "./compressed/"
-                done
+                done <<< "$IMG_FILES"
 
-                7z a -mx=9 gallery.7z ./compressed/*
+                7z a -y -mx=9 gallery.7z ./compressed/*
 
                 curl -sS -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
                      -F document=@"gallery.7z" \
@@ -118,4 +143,4 @@ jobs:
             fi
 
             echo "=== Done: $url ==="
-          done
+          done <<< "$LINKS"
